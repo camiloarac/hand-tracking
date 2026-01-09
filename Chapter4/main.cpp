@@ -25,6 +25,8 @@ XrVector3f operator*(XrVector3f a, float b) {
 #include <algorithm>
 // A deque is used to track the blocks to draw.
 #include <deque>
+// For snprintf
+#include <cstdio>
 // Random numbers for colorful blocks
 #include <random>
 static std::uniform_real_distribution<float> pseudorandom_distribution(0, 1.f);
@@ -503,7 +505,8 @@ private:
 
         m_indexBuffer = m_graphicsAPI->CreateBuffer({GraphicsAPI::BufferCreateInfo::Type::INDEX, sizeof(uint32_t), sizeof(cubeIndices), &cubeIndices});
 
-        size_t numberOfCuboids = m_maxBlockCount + 2 + 2;
+        // Buffer size: blocks + env objects + hand text overlays (~150 pixels per hand)
+        size_t numberOfCuboids = m_maxBlockCount + 2 + 2 + 400;  // Extra margin for safety
         m_uniformBuffer_Camera = m_graphicsAPI->CreateBuffer({GraphicsAPI::BufferCreateInfo::Type::UNIFORM, 0, sizeof(CameraConstants) * numberOfCuboids, nullptr});
         m_uniformBuffer_Normals = m_graphicsAPI->CreateBuffer({GraphicsAPI::BufferCreateInfo::Type::UNIFORM, 0, sizeof(normals), &normals});
 
@@ -777,7 +780,7 @@ private:
                 // Only if the pose was detected this frame:
                 if (m_handPoseState[i].isActive) {
                     // For each block:
-                    for (int j = 0; j < m_blocks.size(); j++) {
+                    for (size_t j = 0; j < m_blocks.size(); j++) {
                         auto block = m_blocks[j];
                         // How far is it from the hand to this block?
                         XrVector3f diff = block.pose.position - m_handPose[i].position;
@@ -949,7 +952,14 @@ private:
     }
 
     size_t renderCuboidIndex = 0;
+    static const size_t MAX_CUBOIDS = 504;  // Must match buffer allocation
+    
     void RenderCuboid(XrPosef pose, XrVector3f scale, XrVector3f color) {
+        // Safety check to prevent buffer overflow crash
+        if (renderCuboidIndex >= MAX_CUBOIDS) {
+            return;  // Skip rendering if buffer is full
+        }
+        
         XrMatrix4x4f_CreateTranslationRotationScale(&cameraConstants.model, &pose.position, &pose.orientation, &scale);
 
         XrMatrix4x4f_Multiply(&cameraConstants.modelViewProj, &cameraConstants.viewProj, &cameraConstants.model);
@@ -969,6 +979,80 @@ private:
         m_graphicsAPI->DrawIndexed(36);
 
         renderCuboidIndex++;
+    }
+
+    // Simple 3x5 digit patterns (compact font) - each digit is 3 wide x 5 tall
+    uint8_t GetDigitPattern(char c, int row) {
+        // Returns 3 bits for the given row of the digit (bit 2 = left, bit 0 = right)
+        static const uint8_t patterns[12][5] = {
+            {0b111, 0b101, 0b101, 0b101, 0b111},  // 0
+            {0b010, 0b110, 0b010, 0b010, 0b111},  // 1
+            {0b111, 0b001, 0b111, 0b100, 0b111},  // 2
+            {0b111, 0b001, 0b111, 0b001, 0b111},  // 3
+            {0b101, 0b101, 0b111, 0b001, 0b001},  // 4
+            {0b111, 0b100, 0b111, 0b001, 0b111},  // 5
+            {0b111, 0b100, 0b111, 0b101, 0b111},  // 6
+            {0b111, 0b001, 0b010, 0b010, 0b010},  // 7
+            {0b111, 0b101, 0b111, 0b101, 0b111},  // 8
+            {0b111, 0b101, 0b111, 0b001, 0b111},  // 9
+            {0b000, 0b000, 0b000, 0b000, 0b010},  // . (period)
+            {0b000, 0b000, 0b111, 0b000, 0b000},  // - (minus)
+        };
+        int idx = -1;
+        if (c >= '0' && c <= '9') idx = c - '0';
+        else if (c == '.') idx = 10;
+        else if (c == '-') idx = 11;
+        if (idx >= 0 && row >= 0 && row < 5) return patterns[idx][row];
+        return 0;
+    }
+
+    // Render a floating number display attached to hand position
+    void RenderHandPositionDisplay(int handIndex) {
+        if (!m_handPoseState[handIndex].isActive) return;
+        
+        XrPosef &handPose = m_handPose[handIndex];
+        float pixelSize = 0.004f;
+        float offsetY = 0.08f;  // Display above the hand
+        
+        // Format position values
+        char xBuf[16], yBuf[16], zBuf[16];
+        snprintf(xBuf, sizeof(xBuf), "%.2f", handPose.position.x);
+        snprintf(yBuf, sizeof(yBuf), "%.2f", handPose.position.y);
+        snprintf(zBuf, sizeof(zBuf), "%.2f", handPose.position.z);
+        
+        // Colors for each axis
+        XrVector3f xColor = {1.0f, 0.3f, 0.3f};  // Red for X
+        XrVector3f yColor = {0.3f, 1.0f, 0.3f};  // Green for Y
+        XrVector3f zColor = {0.3f, 0.3f, 1.0f};  // Blue for Z
+        
+        // Render each axis value as a row of digits
+        float lineSpacing = pixelSize * 7.0f;
+        
+        auto renderNumber = [&](const char* str, float yOffset, XrVector3f color) {
+            float xPos = 0;
+            for (int i = 0; str[i] != '\0'; i++) {
+                for (int row = 0; row < 5; row++) {
+                    uint8_t pattern = GetDigitPattern(str[i], row);
+                    for (int col = 0; col < 3; col++) {
+                        if (pattern & (1 << (2 - col))) {
+                            XrVector3f pixelPos = {
+                                handPose.position.x + xPos + col * pixelSize,
+                                handPose.position.y + offsetY + yOffset - row * pixelSize,
+                                handPose.position.z
+                            };
+                            RenderCuboid({{0.0f, 0.0f, 0.0f, 1.0f}, pixelPos},
+                                        {pixelSize * 0.8f, pixelSize * 0.8f, pixelSize * 0.3f},
+                                        color);
+                        }
+                    }
+                }
+                xPos += pixelSize * 4.0f;  // Character spacing
+            }
+        };
+        
+        renderNumber(xBuf, lineSpacing, xColor);
+        renderNumber(yBuf, 0, yColor);
+        renderNumber(zBuf, -lineSpacing, zColor);
     }
 
     void RenderFrame() {
@@ -1108,9 +1192,11 @@ private:
             for (int j = 0; j < 2; j++) {
                 if (m_handPoseState[j].isActive) {
                     RenderCuboid(m_handPose[j], {0.02f, 0.04f, 0.10f}, {1.f, 1.f, 1.f});
+                    // Render position text overlay attached to hand
+                    RenderHandPositionDisplay(j);
                 }
             }
-            for (int j = 0; j < m_blocks.size(); j++) {
+            for (size_t j = 0; j < m_blocks.size(); j++) {
                 auto &thisBlock = m_blocks[j];
                 XrVector3f sc = thisBlock.scale;
                 if (j == m_nearBlock[0] || j == m_nearBlock[1])
